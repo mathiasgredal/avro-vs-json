@@ -1,0 +1,17 @@
+node_modules/
+venv/
+.venv/
+__pycache__/
+.pytest_cache/
+dist/
+*.log
+bench_results/
+.DS_Store
+
+# Go
+go/bench
+
+# Results (keep images but ignore JSON)
+results/*.json
+
+

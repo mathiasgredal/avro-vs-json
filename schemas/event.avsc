@@ -1,0 +1,14 @@
+{
+  "type": "record",
+  "name": "BenchmarkEvent",
+  "namespace": "bench",
+  "fields": [
+    { "name": "id", "type": "string" },
+    { "name": "ts_unix_ms", "type": "long" },
+    { "name": "category", "type": "string" },
+    { "name": "value", "type": "double" },
+    { "name": "message", "type": "string" }
+  ]
+}
+
+
