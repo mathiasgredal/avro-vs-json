@@ -50,6 +50,8 @@ This will generate performance comparison charts in the `results/` directory:
 - Batch size comparison (10, 50, 100, 500, 1000)
 - Message count comparison (10k, 50k, 100k)
 - Message size comparison (small vs large)
+- Network usage comparison (batch size and compression impact)
+- Average network bytes per message comparison
 - Overall performance comparison
 
 ### Notes
@@ -83,4 +85,12 @@ The benchmark suite generates several performance comparison charts:
 #### Message Size Comparison
 ![Message Size Comparison](results/message_size_comparison.png)
 *Comparison of performance when handling small vs large message payloads, demonstrating how message size impacts throughput for different serialization formats.*
+
+#### Network Usage Comparison
+![Network Usage Comparison](results/network_usage_comparison.png)
+*Network bandwidth consumption analysis comparing JSON vs Avro with different batch sizes (10 vs 100) and compression settings (none vs gzip), showing the impact of batching and compression on network efficiency.*
+
+#### Average Network Bytes per Message
+![Average Network Bytes per Message](results/average_message_size_comparison.png)
+*Average network bytes per message including protocol overhead, demonstrating how different configurations affect the network efficiency of message transmission in Kafka.*
 

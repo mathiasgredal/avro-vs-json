@@ -12,9 +12,77 @@ import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import numpy as np
+import re
+import time
 
 # Ensure we're in the project root
 os.chdir(Path(__file__).parent)
+
+def get_network_stats():
+    """Get network interface statistics from Kafka container using /proc/net/dev"""
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "exec", "-T", "kafka", "cat", "/proc/net/dev"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            print(f"  WARNING: Failed to get network stats: {result.stderr}")
+            return None
+        
+        # Parse /proc/net/dev output to extract interface statistics
+        lines = result.stdout.strip().split('\n')
+        stats = {}
+        
+        for line in lines[2:]:  # Skip header lines
+            if ':' in line:
+                parts = line.split(':')
+                interface = parts[0].strip()
+                data = parts[1].split()
+                
+                if len(data) >= 16:  # Ensure we have all columns
+                    try:
+                        # RX bytes is first column, TX bytes is 9th column (0-indexed)
+                        rx_bytes = int(data[0])
+                        tx_bytes = int(data[8])
+                        stats[interface] = {
+                            'rx_bytes': rx_bytes,
+                            'tx_bytes': tx_bytes,
+                            'total_bytes': rx_bytes + tx_bytes
+                        }
+                    except (ValueError, IndexError):
+                        continue
+        
+        return stats
+    except Exception as e:
+        print(f"  WARNING: Error getting network stats: {e}")
+        return None
+
+def calculate_network_delta(before_stats, after_stats):
+    """Calculate network usage delta between two stat snapshots"""
+    if not before_stats or not after_stats:
+        return None
+    
+    delta = {}
+    total_delta = 0
+    
+    for interface in before_stats:
+        if interface in after_stats:
+            rx_delta = after_stats[interface]['rx_bytes'] - before_stats[interface]['rx_bytes']
+            tx_delta = after_stats[interface]['tx_bytes'] - before_stats[interface]['tx_bytes']
+            total_interface_delta = rx_delta + tx_delta
+            
+            delta[interface] = {
+                'rx_bytes': rx_delta,
+                'tx_bytes': tx_delta,
+                'total_bytes': total_interface_delta
+            }
+            total_delta += total_interface_delta
+    
+    return {
+        'interfaces': delta,
+        'total_bytes': total_delta,
+        'total_mb': total_delta / (1024 * 1024)
+    }
 
 def run_benchmark(lang, mode, messages, batch, compression, brokers="localhost:9094", large=False):
     """Run a single benchmark and return parsed results"""
@@ -67,6 +135,92 @@ def run_benchmark(lang, mode, messages, batch, compression, brokers="localhost:9
         output = result.stdout.strip()
         data = json.loads(output)
         print(f"  ✓ Produced {data['produced']} msgs in {data['durationSec']:.2f}s ({data['rate']:.0f} msg/s)")
+        return data
+    except subprocess.TimeoutExpired:
+        print(f"  ERROR: Benchmark timed out")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"  ERROR: Failed to parse JSON: {e}")
+        print(f"  Output was: {result.stdout}")
+        return None
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        return None
+
+
+def run_benchmark_with_network(lang, mode, messages, batch, compression, brokers="localhost:9094", large=False):
+    """Run a single benchmark with network monitoring and return parsed results"""
+    size_label = "large" if large else "small"
+    print(f"Running: {lang} {mode} messages={messages} batch={batch} compression={compression} size={size_label}")
+    
+    # Get network stats before benchmark
+    print("  Capturing network stats before benchmark...")
+    before_stats = get_network_stats()
+    
+    if lang == "node":
+        cmd = [
+            "node", "node/bench.js",
+            "--mode", mode,
+            "--messages", str(messages),
+            "--batch", str(batch),
+            "--compression", compression,
+            "--brokers", brokers
+        ]
+        if large:
+            cmd.append("--large")
+    elif lang == "go":
+        cmd = [
+            "./go/bench",
+            "--mode", mode,
+            "--messages", str(messages),
+            "--batch", str(batch),
+            "--compression", compression,
+            "--brokers", brokers
+        ]
+        if large:
+            cmd.append("--large")
+    else:  # python
+        cmd = [
+            ".venv/bin/python", "python/bench.py",
+            "--mode", mode,
+            "--messages", str(messages),
+            "--batch", str(batch),
+            "--compression", compression,
+            "--brokers", brokers
+        ]
+        if large:
+            cmd.append("--large")
+    
+    try:
+        my_env = os.environ.copy()
+        my_env["GOMAXPROCS"] = "1"
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=my_env)
+        if result.returncode != 0:
+            print(f"  ERROR: {result.stderr}")
+            return None
+        
+        # Get network stats after benchmark
+        print("  Capturing network stats after benchmark...")
+        after_stats = get_network_stats()
+        
+        # Calculate network delta
+        network_delta = calculate_network_delta(before_stats, after_stats)
+        
+        # Parse JSON output
+        output = result.stdout.strip()
+        data = json.loads(output)
+        
+        # Add network information to results
+        if network_delta:
+            data['network_bytes'] = network_delta['total_bytes']
+            data['network_mb'] = network_delta['total_mb']
+            data['network_delta'] = network_delta
+            print(f"  ✓ Produced {data['produced']} msgs in {data['durationSec']:.2f}s ({data['rate']:.0f} msg/s)")
+            print(f"  ✓ Network usage: {data['network_mb']:.2f} MB")
+        else:
+            print(f"  ✓ Produced {data['produced']} msgs in {data['durationSec']:.2f}s ({data['rate']:.0f} msg/s)")
+            print(f"  ⚠ Network monitoring failed")
+        
         return data
     except subprocess.TimeoutExpired:
         print(f"  ERROR: Benchmark timed out")
@@ -400,6 +554,180 @@ def plot_overall_comparison(results, output_file="results/overall_comparison.png
     print(f"✓ Saved plot: {output_file}")
 
 
+def plot_network_usage_comparison(results, output_file="results/network_usage_comparison.png"):
+    """Plot simplified network usage comparison focusing on key configurations"""
+    if os.path.exists(output_file):
+        print(f"⏭️  Skipping {output_file} (already exists)")
+        return
+    
+    # Filter results that have network data
+    network_results = [r for r in results if 'network_mb' in r]
+    if not network_results:
+        print(f"⚠️  No network data available for {output_file}")
+        return
+    
+    # Use all network results (batch 10 and 100)
+    if not network_results:
+        print(f"⚠️  No network data available")
+        return
+    
+    # Create single plot for network usage
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Group by lang-mode-compression-batch
+    configs = {}
+    for r in network_results:
+        key = f"{r['lang']}-{r['mode']}-{r['compression']}-batch{r['batch']}"
+        if key not in configs:
+            configs[key] = {
+                'network_mb': [],
+                'lang': r['lang'],
+                'mode': r['mode'],
+                'compression': r['compression'],
+                'batch': r['batch']
+            }
+        configs[key]['network_mb'].append(r['network_mb'])
+    
+    # Sort configurations for consistent plotting
+    sorted_configs = sorted(configs.items(), key=lambda x: (x[1]['lang'], x[1]['mode'], x[1]['compression'], x[1]['batch']))
+    
+    # Plot network usage
+    x_pos = np.arange(len(sorted_configs))
+    network_means = [np.mean(config['network_mb']) for _, config in sorted_configs]
+    network_stds = [np.std(config['network_mb']) for _, config in sorted_configs]
+    
+    # Color coding: different colors for batch sizes, patterns for compression
+    colors = []
+    for _, config in sorted_configs:
+        if config['mode'] == 'json':
+            if config['compression'] == 'none':
+                colors.append('#3498db' if config['batch'] == 10 else '#2ecc71')  # Light blue for batch 10, green for batch 100
+            else:  # gzip
+                colors.append('#e74c3c' if config['batch'] == 10 else '#f39c12')  # Red for batch 10, orange for batch 100
+        else:  # avro
+            if config['compression'] == 'none':
+                colors.append('#9b59b6' if config['batch'] == 10 else '#1abc9c')  # Purple for batch 10, teal for batch 100
+            else:  # gzip
+                colors.append('#34495e' if config['batch'] == 10 else '#95a5a6')  # Dark gray for batch 10, light gray for batch 100
+    
+    bars = ax.bar(x_pos, network_means, yerr=network_stds, capsize=5,
+                  color=colors, edgecolor='black', linewidth=0.5, alpha=0.8)
+    
+    ax.set_xlabel('Configuration', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Network Usage (MB)', fontsize=12, fontweight='bold')
+    ax.set_title('Network Usage: Batch Size and Compression Impact', fontsize=14, fontweight='bold')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([f"{config['mode']}\n{config['compression']}-batch{config['batch']}" 
+                        for _, config in sorted_configs], rotation=45, ha='right')
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    # Add value labels on bars
+    for i, (bar, mean) in enumerate(zip(bars, network_means)):
+        ax.text(bar.get_x() + bar.get_width()/2., mean,
+                f'{mean:.1f}',
+                ha='center', va='bottom', fontsize=10)
+    
+    # Create legend
+    legend_elements = [
+        plt.Rectangle((0,0),1,1, facecolor='#3498db', label='JSON-none-batch10'),
+        plt.Rectangle((0,0),1,1, facecolor='#2ecc71', label='JSON-none-batch100'),
+        plt.Rectangle((0,0),1,1, facecolor='#e74c3c', label='JSON-gzip-batch10'),
+        plt.Rectangle((0,0),1,1, facecolor='#f39c12', label='JSON-gzip-batch100'),
+        plt.Rectangle((0,0),1,1, facecolor='#9b59b6', label='Avro-none-batch10'),
+        plt.Rectangle((0,0),1,1, facecolor='#1abc9c', label='Avro-none-batch100'),
+        plt.Rectangle((0,0),1,1, facecolor='#34495e', label='Avro-gzip-batch10'),
+        plt.Rectangle((0,0),1,1, facecolor='#95a5a6', label='Avro-gzip-batch100')
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=9)
+    
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"✓ Saved plot: {output_file}")
+
+
+def plot_average_message_size_comparison(results, output_file="results/average_message_size_comparison.png"):
+    """Plot average message size in bytes for different configurations"""
+    if os.path.exists(output_file):
+        print(f"⏭️  Skipping {output_file} (already exists)")
+        return
+    
+    # Filter results that have network data
+    network_results = [r for r in results if 'network_bytes' in r and r['network_bytes'] > 0]
+    if not network_results:
+        print(f"⚠️  No network data available for {output_file}")
+        return
+    
+    # Calculate average message size in bytes
+    for r in network_results:
+        r['avg_message_size'] = r['network_bytes'] / r['produced'] if r['produced'] > 0 else 0
+    
+    # Group by lang, mode, compression, batch
+    data = {}
+    for r in network_results:
+        key = (r['lang'], r['mode'], r['compression'], r['batch'])
+        if key not in data:
+            data[key] = []
+        data[key].append(r['avg_message_size'])
+    
+    # Create plot
+    fig, ax = plt.subplots(figsize=(16, 8))
+    
+    # Sort configurations
+    sorted_keys = sorted(data.keys())
+    x_pos = np.arange(len(sorted_keys))
+    size_means = [np.mean(data[key]) for key in sorted_keys]
+    size_stds = [np.std(data[key]) for key in sorted_keys]
+    
+    # Color coding: different colors for batch sizes, patterns for compression
+    colors = []
+    for key in sorted_keys:
+        lang, mode, compression, batch = key
+        if mode == 'json':
+            if compression == 'none':
+                colors.append('#3498db' if batch == 10 else '#2ecc71')  # Light blue for batch 10, green for batch 100
+            else:  # gzip
+                colors.append('#e74c3c' if batch == 10 else '#f39c12')  # Red for batch 10, orange for batch 100
+        else:  # avro
+            if compression == 'none':
+                colors.append('#9b59b6' if batch == 10 else '#1abc9c')  # Purple for batch 10, teal for batch 100
+            else:  # gzip
+                colors.append('#34495e' if batch == 10 else '#95a5a6')  # Dark gray for batch 10, light gray for batch 100
+    
+    bars = ax.bar(x_pos, size_means, yerr=size_stds, capsize=5,
+                  color=colors, edgecolor='black', linewidth=0.5, alpha=0.8)
+    
+    ax.set_xlabel('Configuration', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Average Network Bytes per Message', fontsize=12, fontweight='bold')
+    ax.set_title('Average Network Bytes per Message (including protocol overhead)', fontsize=14, fontweight='bold')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([f"{key[1]}\n{key[2]}-batch{key[3]}" for key in sorted_keys], 
+                       rotation=45, ha='right')
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    # Add value labels on bars
+    for i, (bar, mean) in enumerate(zip(bars, size_means)):
+        ax.text(bar.get_x() + bar.get_width()/2., mean,
+                f'{int(mean)}',
+                ha='center', va='bottom', fontsize=8, rotation=90)
+    
+    # Create legend
+    legend_elements = [
+        plt.Rectangle((0,0),1,1, facecolor='#3498db', label='JSON-none-batch10'),
+        plt.Rectangle((0,0),1,1, facecolor='#2ecc71', label='JSON-none-batch100'),
+        plt.Rectangle((0,0),1,1, facecolor='#e74c3c', label='JSON-gzip-batch10'),
+        plt.Rectangle((0,0),1,1, facecolor='#f39c12', label='JSON-gzip-batch100'),
+        plt.Rectangle((0,0),1,1, facecolor='#9b59b6', label='Avro-none-batch10'),
+        plt.Rectangle((0,0),1,1, facecolor='#1abc9c', label='Avro-none-batch100'),
+        plt.Rectangle((0,0),1,1, facecolor='#34495e', label='Avro-gzip-batch10'),
+        plt.Rectangle((0,0),1,1, facecolor='#95a5a6', label='Avro-gzip-batch100')
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=9)
+    
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"✓ Saved plot: {output_file}")
+
+
 def main():
     print("=" * 80)
     print("KAFKA BENCHMARK SUITE")
@@ -523,6 +851,41 @@ def main():
     else:
         print(f"\n⏭️  Skipping TEST 4: Message Size Comparison ({message_size_file} exists)")
     
+    # Test 5: Network usage comparison (batching and compression impact)
+    network_usage_file = "results/network_usage_comparison.png"
+    message_size_file = "results/average_message_size_comparison.png"
+    if not os.path.exists(network_usage_file) or not os.path.exists(message_size_file):
+        print("\n" + "=" * 80)
+        print("TEST 5: Network Usage Comparison (Batching and Compression Impact)")
+        print("=" * 80)
+        network_results = []
+        
+        # Test key combinations: batch 10 vs 100, gzip vs none (Node.js only)
+        batch_sizes = [10, 100]  # Compare small vs large batching
+        compressions = ["none", "gzip"]  # Compare no compression vs gzip
+        
+        # Only test Node.js for network comparison
+        lang = "node"
+        for mode in modes:
+            for batch in batch_sizes:
+                for comp in compressions:
+                    result = run_benchmark_with_network(lang, mode, messages=10000, batch=batch, compression=comp)
+                    if result:
+                        result['compression'] = comp
+                        result['batch'] = batch
+                        result['messages'] = 10000
+                        result['large'] = False
+                        network_results.append(result)
+                        all_results.append(result)
+        
+        if network_results:
+            plot_network_usage_comparison(network_results)
+            plot_average_message_size_comparison(network_results)
+        else:
+            print("⚠️  No network benchmark results to plot")
+    else:
+        print(f"\n⏭️  Skipping TEST 5: Network Usage Comparison (plots exist)")
+    
     # Overall comparison
     if all_results:
         plot_overall_comparison(all_results)
@@ -541,6 +904,8 @@ def main():
     print("  - results/batch_size_comparison.png")
     print("  - results/message_count_comparison.png")
     print("  - results/message_size_comparison.png")
+    print("  - results/network_usage_comparison.png")
+    print("  - results/average_message_size_comparison.png")
     print("  - results/overall_comparison.png")
 
 

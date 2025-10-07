@@ -1,7 +1,9 @@
 name: bench
 services:
   kafka:
-    image: confluentinc/cp-kafka:7.6.1
+    build:
+      context: .
+      dockerfile: Dockerfile.kafka
     container_name: kafka
     ports:
       - "9094:9094" # external listener for host
