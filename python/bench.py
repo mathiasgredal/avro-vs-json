@@ -136,7 +136,8 @@ def main():
         produced_count += 1
         
         # Poll producer to handle delivery callbacks
-        producer.poll(0)
+        if produced_count % args.batch == 0:
+            producer.poll(0)
 
     # Flush all remaining messages
     producer.flush()

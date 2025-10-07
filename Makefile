@@ -1,9 +1,9 @@
 SHELL := /bin/bash
 
 BROKERS ?= localhost:9094
-MESSAGES ?= 10000
+MESSAGES ?= 100000
 BATCH ?= 100
-COMPRESSION ?= none
+COMPRESSION ?= gzip
 
 .PHONY: up down topics node-install py-venv py-install go-build node-json node-avro py-json py-avro go-json go-avro clean
 
